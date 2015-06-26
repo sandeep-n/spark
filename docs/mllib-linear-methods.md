@@ -4,6 +4,11 @@ title: Linear Methods - MLlib
 displayTitle: <a href="mllib-guide.html">MLlib</a> - Linear Methods
 ---
 
+<!---
+your comment goes here
+and here
+-->
+
 * Table of contents
 {:toc}
 
@@ -119,7 +124,7 @@ Under the hood, linear methods use convex optimization methods to optimize the o
 [Classification](http://en.wikipedia.org/wiki/Statistical_classification) aims to divide items into
 categories.
 The most common classification type is
-[binary classificaion](http://en.wikipedia.org/wiki/Binary_classification), where there are two
+[binary classification](http://en.wikipedia.org/wiki/Binary_classification), where there are two
 categories, usually named positive and negative.
 If there are more than two categories, it is called
 [multiclass classification](http://en.wikipedia.org/wiki/Multiclass_classification).
@@ -149,7 +154,7 @@ the problem becomes a [linear program](http://en.wikipedia.org/wiki/Linear_progr
 
 The linear SVMs algorithm outputs an SVM model. Given a new data point,
 denoted by $\x$, the model makes predictions based on the value of $\wv^T \x$.
-By the default, if $\wv^T \x \geq 0$ then the outcome is positive, and negative
+By default, if $\wv^T \x \geq 0$ then the outcome is positive, and negative
 otherwise.
 
 **Examples**
@@ -374,7 +379,7 @@ In MLlib, the first class $0$ is chosen as the "pivot" class.
 See Section 4.4 of
 [The Elements of Statistical Learning](http://statweb.stanford.edu/~tibs/ElemStatLearn/) for
 references.
-Here is an
+Here is a
 [detailed mathematical derivation](http://www.slideshare.net/dbtsai/2014-0620-mlor-36132297).
 
 For multiclass classification problems, the algorithm will outputs a multinomial logistic regression
@@ -571,7 +576,8 @@ val parsedData = data.map { line =>
 
 // Building the model
 val numIterations = 100
-val model = LinearRegressionWithSGD.train(parsedData, numIterations)
+val stepSize = 0.00000001
+val model = LinearRegressionWithSGD.train(parsedData, numIterations, stepSize)
 
 // Evaluate model on training examples and compute training error
 val valuesAndPreds = parsedData.map { point =>
