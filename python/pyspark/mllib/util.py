@@ -15,12 +15,15 @@
 # limitations under the License.
 #
 
+import sys
 import numpy as np
 import warnings
 
-from pyspark.mllib.common import callMLlibFunc, JavaModelWrapper, inherit_doc
+if sys.version > '3':
+    xrange = range
+
+from pyspark.mllib.common import callMLlibFunc, inherit_doc
 from pyspark.mllib.linalg import Vectors, SparseVector, _convert_to_vector
-from pyspark.mllib.regression import LabeledPoint
 
 
 class MLUtils(object):
@@ -50,6 +53,7 @@ class MLUtils(object):
     @staticmethod
     def _convert_labeled_point_to_libsvm(p):
         """Converts a LabeledPoint to a string in LIBSVM format."""
+        from pyspark.mllib.regression import LabeledPoint
         assert isinstance(p, LabeledPoint)
         items = [str(p.label)]
         v = _convert_to_vector(p.features)
@@ -92,24 +96,20 @@ class MLUtils(object):
 
         >>> from tempfile import NamedTemporaryFile
         >>> from pyspark.mllib.util import MLUtils
+        >>> from pyspark.mllib.regression import LabeledPoint
         >>> tempFile = NamedTemporaryFile(delete=True)
-        >>> tempFile.write("+1 1:1.0 3:2.0 5:3.0\\n-1\\n-1 2:4.0 4:5.0 6:6.0")
+        >>> _ = tempFile.write(b"+1 1:1.0 3:2.0 5:3.0\\n-1\\n-1 2:4.0 4:5.0 6:6.0")
         >>> tempFile.flush()
         >>> examples = MLUtils.loadLibSVMFile(sc, tempFile.name).collect()
         >>> tempFile.close()
-        >>> type(examples[0]) == LabeledPoint
-        True
-        >>> print examples[0]
-        (1.0,(6,[0,2,4],[1.0,2.0,3.0]))
-        >>> type(examples[1]) == LabeledPoint
-        True
-        >>> print examples[1]
-        (-1.0,(6,[],[]))
-        >>> type(examples[2]) == LabeledPoint
-        True
-        >>> print examples[2]
-        (-1.0,(6,[1,3,5],[4.0,5.0,6.0]))
+        >>> examples[0]
+        LabeledPoint(1.0, (6,[0,2,4],[1.0,2.0,3.0]))
+        >>> examples[1]
+        LabeledPoint(-1.0, (6,[],[]))
+        >>> examples[2]
+        LabeledPoint(-1.0, (6,[1,3,5],[4.0,5.0,6.0]))
         """
+        from pyspark.mllib.regression import LabeledPoint
         if multiclass is not None:
             warnings.warn("deprecated", DeprecationWarning)
 
@@ -130,6 +130,7 @@ class MLUtils(object):
 
         >>> from tempfile import NamedTemporaryFile
         >>> from fileinput import input
+        >>> from pyspark.mllib.regression import LabeledPoint
         >>> from glob import glob
         >>> from pyspark.mllib.util import MLUtils
         >>> examples = [LabeledPoint(1.1, Vectors.sparse(3, [(0, 1.23), (2, 4.56)])), \
@@ -156,6 +157,7 @@ class MLUtils(object):
 
         >>> from tempfile import NamedTemporaryFile
         >>> from pyspark.mllib.util import MLUtils
+        >>> from pyspark.mllib.regression import LabeledPoint
         >>> examples = [LabeledPoint(1.1, Vectors.sparse(3, [(0, -1.23), (2, 4.56e-7)])), \
                         LabeledPoint(0.0, Vectors.dense([1.01, 2.02, 3.03]))]
         >>> tempFile = NamedTemporaryFile(delete=True)
@@ -253,6 +255,41 @@ class JavaLoader(Loader):
     def load(cls, sc, path):
         java_model = cls._load_java(sc, path)
         return cls(java_model)
+
+
+class LinearDataGenerator(object):
+    """Utils for generating linear data"""
+
+    @staticmethod
+    def generateLinearInput(intercept, weights, xMean, xVariance,
+                            nPoints, seed, eps):
+        """
+        :param: intercept bias factor, the term c in X'w + c
+        :param: weights   feature vector, the term w in X'w + c
+        :param: xMean     Point around which the data X is centered.
+        :param: xVariance Variance of the given data
+        :param: nPoints   Number of points to be generated
+        :param: seed      Random Seed
+        :param: eps       Used to scale the noise. If eps is set high,
+                          the amount of gaussian noise added is more.
+        Returns a list of LabeledPoints of length nPoints
+        """
+        weights = [float(weight) for weight in weights]
+        xMean = [float(mean) for mean in xMean]
+        xVariance = [float(var) for var in xVariance]
+        return list(callMLlibFunc(
+            "generateLinearInputWrapper", float(intercept), weights, xMean,
+            xVariance, int(nPoints), int(seed), float(eps)))
+
+    @staticmethod
+    def generateLinearRDD(sc, nexamples, nfeatures, eps,
+                          nParts=2, intercept=0.0):
+        """
+        Generate a RDD of LabeledPoints.
+        """
+        return callMLlibFunc(
+            "generateLinearRDDWrapper", sc, int(nexamples), int(nfeatures),
+            float(eps), int(nParts), float(intercept))
 
 
 def _test():

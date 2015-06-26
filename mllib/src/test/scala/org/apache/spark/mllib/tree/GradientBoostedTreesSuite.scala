@@ -17,8 +17,7 @@
 
 package org.apache.spark.mllib.tree
 
-import org.scalatest.FunSuite
-
+import org.apache.spark.SparkFunSuite
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.configuration.Algo._
 import org.apache.spark.mllib.tree.configuration.{BoostingStrategy, Strategy}
@@ -32,7 +31,7 @@ import org.apache.spark.util.Utils
 /**
  * Test suite for [[GradientBoostedTrees]].
  */
-class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
+class GradientBoostedTreesSuite extends SparkFunSuite with MLlibTestSparkContext {
 
   test("Regression with continuous features: SquaredError") {
     GradientBoostedTreesSuite.testCombinations.foreach {
@@ -175,10 +174,11 @@ class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
           new BoostingStrategy(treeStrategy, loss, numIterations, validationTol = 0.0)
         val gbtValidate = new GradientBoostedTrees(boostingStrategy)
           .runWithValidation(trainRdd, validateRdd)
-        assert(gbtValidate.numTrees !== numIterations)
+        val numTrees = gbtValidate.numTrees
+        assert(numTrees !== numIterations)
 
         // Test that it performs better on the validation dataset.
-        val gbt = GradientBoostedTrees.train(trainRdd, boostingStrategy)
+        val gbt = new GradientBoostedTrees(boostingStrategy).run(trainRdd)
         val (errorWithoutValidation, errorWithValidation) = {
           if (algo == Classification) {
             val remappedRdd = validateRdd.map(x => new LabeledPoint(2 * x.label - 1, x.features))
@@ -188,6 +188,17 @@ class GradientBoostedTreesSuite extends FunSuite with MLlibTestSparkContext {
           }
         }
         assert(errorWithValidation <= errorWithoutValidation)
+
+        // Test that results from evaluateEachIteration comply with runWithValidation.
+        // Note that convergenceTol is set to 0.0
+        val evaluationArray = gbt.evaluateEachIteration(validateRdd, loss)
+        assert(evaluationArray.length === numIterations)
+        assert(evaluationArray(numTrees) > evaluationArray(numTrees - 1))
+        var i = 1
+        while (i < numTrees) {
+          assert(evaluationArray(i) <= evaluationArray(i - 1))
+          i += 1
+        }
       }
     }
   }

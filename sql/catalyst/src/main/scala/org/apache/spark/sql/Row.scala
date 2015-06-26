@@ -17,10 +17,8 @@
 
 package org.apache.spark.sql
 
-import scala.util.hashing.MurmurHash3
-
 import org.apache.spark.sql.catalyst.expressions.GenericRow
-import org.apache.spark.sql.types.{StructType, DateUtils}
+import org.apache.spark.sql.types.StructType
 
 object Row {
   /**
@@ -55,6 +53,9 @@ object Row {
     // TODO: Improve the performance of this if used in performance critical part.
     new GenericRow(rows.flatMap(_.toSeq).toArray)
   }
+
+  /** Returns an empty row. */
+  val empty = apply()
 }
 
 
@@ -260,6 +261,13 @@ trait Row extends Serializable {
   def getDate(i: Int): java.sql.Date = apply(i).asInstanceOf[java.sql.Date]
 
   /**
+   * Returns the value at position i of date type as java.sql.Timestamp.
+   *
+   * @throws ClassCastException when data type does not match.
+   */
+  def getTimestamp(i: Int): java.sql.Timestamp = apply(i).asInstanceOf[java.sql.Timestamp]
+
+  /**
    * Returns the value at position i of array type as a Scala Seq.
    *
    * @throws ClassCastException when data type does not match.
@@ -305,6 +313,38 @@ trait Row extends Serializable {
    */
   def getAs[T](i: Int): T = apply(i).asInstanceOf[T]
 
+  /**
+   * Returns the value of a given fieldName.
+   *
+   * @throws UnsupportedOperationException when schema is not defined.
+   * @throws IllegalArgumentException when fieldName do not exist.
+   * @throws ClassCastException when data type does not match.
+   */
+  def getAs[T](fieldName: String): T = getAs[T](fieldIndex(fieldName))
+
+  /**
+   * Returns the index of a given field name.
+   *
+   * @throws UnsupportedOperationException when schema is not defined.
+   * @throws IllegalArgumentException when fieldName do not exist.
+   */
+  def fieldIndex(name: String): Int = {
+    throw new UnsupportedOperationException("fieldIndex on a Row without schema is undefined.")
+  }
+
+  /**
+   * Returns a Map(name -> value) for the requested fieldNames
+   *
+   * @throws UnsupportedOperationException when schema is not defined.
+   * @throws IllegalArgumentException when fieldName do not exist.
+   * @throws ClassCastException when data type does not match.
+   */
+  def getValuesMap[T](fieldNames: Seq[String]): Map[String, T] = {
+    fieldNames.map { name =>
+      name -> getAs[T](name)
+    }.toMap
+  }
+
   override def toString(): String = s"[${this.mkString(",")}]"
 
   /**
@@ -321,36 +361,6 @@ trait Row extends Serializable {
       i += 1
     }
     false
-  }
-
-  override def equals(that: Any): Boolean = that match {
-    case null => false
-    case that: Row =>
-      if (this.length != that.length) {
-        return false
-      }
-      var i = 0
-      val len = this.length
-      while (i < len) {
-        if (apply(i) != that.apply(i)) {
-          return false
-        }
-        i += 1
-      }
-      true
-    case _ => false
-  }
-
-  override def hashCode: Int = {
-    // Using Scala's Seq hash code implementation.
-    var n = 0
-    var h = MurmurHash3.seqSeed
-    val len = length
-    while (n < len) {
-      h = MurmurHash3.mix(h, apply(n).##)
-      n += 1
-    }
-    MurmurHash3.finalizeHash(h, n)
   }
 
   /* ---------------------- utility methods for Scala ---------------------- */

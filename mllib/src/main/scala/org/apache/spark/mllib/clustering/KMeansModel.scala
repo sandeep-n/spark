@@ -17,12 +17,15 @@
 
 package org.apache.spark.mllib.clustering
 
+import scala.collection.JavaConverters._
+
 import org.json4s._
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.mllib.pmml.PMMLExportable
 import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.SparkContext
@@ -32,7 +35,11 @@ import org.apache.spark.sql.Row
 /**
  * A clustering model for K-means. Each point belongs to the cluster with the closest center.
  */
-class KMeansModel (val clusterCenters: Array[Vector]) extends Saveable with Serializable {
+class KMeansModel (
+    val clusterCenters: Array[Vector]) extends Saveable with Serializable with PMMLExportable {
+
+  /** A Java-friendly constructor that takes an Iterable of Vectors. */
+  def this(centers: java.lang.Iterable[Vector]) = this(centers.asScala.toArray)
 
   /** Total number of clusters. */
   def k: Int = clusterCenters.length
@@ -103,7 +110,7 @@ object KMeansModel extends Loader[KMeansModel] {
       val dataRDD = sc.parallelize(model.clusterCenters.zipWithIndex).map { case (point, id) =>
         Cluster(id, point)
       }.toDF()
-      dataRDD.saveAsParquetFile(Loader.dataPath(path))
+      dataRDD.write.parquet(Loader.dataPath(path))
     }
 
     def load(sc: SparkContext, path: String): KMeansModel = {
@@ -113,7 +120,7 @@ object KMeansModel extends Loader[KMeansModel] {
       assert(className == thisClassName)
       assert(formatVersion == thisFormatVersion)
       val k = (metadata \ "k").extract[Int]
-      val centriods = sqlContext.parquetFile(Loader.dataPath(path))
+      val centriods = sqlContext.read.parquet(Loader.dataPath(path))
       Loader.checkSchema[Cluster](centriods.schema)
       val localCentriods = centriods.map(Cluster.apply).collect()
       assert(k == localCentriods.size)

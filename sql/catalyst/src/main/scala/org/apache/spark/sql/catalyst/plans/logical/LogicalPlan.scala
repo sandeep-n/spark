@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.plans.logical
 
 import org.apache.spark.Logging
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.analysis.{UnresolvedGetField, Resolver}
+import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.trees.TreeNode
@@ -50,19 +50,19 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
    * [[org.apache.spark.sql.catalyst.analysis.UnresolvedRelation UnresolvedRelation]]
    * should return `false`).
    */
-  lazy val resolved: Boolean = !expressions.exists(!_.resolved) && childrenResolved
+  lazy val resolved: Boolean = expressions.forall(_.resolved) && childrenResolved
 
   override protected def statePrefix = if (!resolved) "'" else super.statePrefix
 
   /**
    * Returns true if all its children of this query plan have been resolved.
    */
-  def childrenResolved: Boolean = !children.exists(!_.resolved)
+  def childrenResolved: Boolean = children.forall(_.resolved)
 
   /**
    * Returns true when the given logical plan will return the same results as this logical plan.
    *
-   * Since its likely undecideable to generally determine if two given plans will produce the same
+   * Since its likely undecidable to generally determine if two given plans will produce the same
    * results, it is okay for this function to return false, even if the results are actually
    * the same.  Such behavior will not affect correctness, only the application of performance
    * enhancements like caching.  However, it is not acceptable to return true if the results could
@@ -73,12 +73,16 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
    * can do better should override this function.
    */
   def sameResult(plan: LogicalPlan): Boolean = {
-    plan.getClass == this.getClass &&
-    plan.children.size == children.size && {
-      logDebug(s"[${cleanArgs.mkString(", ")}] == [${plan.cleanArgs.mkString(", ")}]")
-      cleanArgs == plan.cleanArgs
+    val cleanLeft = EliminateSubQueries(this)
+    val cleanRight = EliminateSubQueries(plan)
+
+    cleanLeft.getClass == cleanRight.getClass &&
+      cleanLeft.children.size == cleanRight.children.size && {
+      logDebug(
+        s"[${cleanRight.cleanArgs.mkString(", ")}] == [${cleanLeft.cleanArgs.mkString(", ")}]")
+      cleanRight.cleanArgs == cleanLeft.cleanArgs
     } &&
-    (plan.children, children).zipped.forall(_ sameResult _)
+    (cleanLeft.children, cleanRight.children).zipped.forall(_ sameResult _)
   }
 
   /** Args that have cleaned such that differences in expression id should not affect equality */
@@ -86,7 +90,7 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
     val input = children.flatMap(_.output)
     productIterator.map {
       // Children are checked using sameResult above.
-      case tn: TreeNode[_] if children contains tn => null
+      case tn: TreeNode[_] if containsChild(tn) => null
       case e: Expression => BindReferences.bindReference(e, input, allowFailures = true)
       case s: Option[_] => s.map {
         case e: Expression => BindReferences.bindReference(e, input, allowFailures = true)
@@ -101,20 +105,75 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
   }
 
   /**
-   * Optionally resolves the given string to a [[NamedExpression]] using the input from all child
+   * Optionally resolves the given strings to a [[NamedExpression]] using the input from all child
    * nodes of this LogicalPlan. The attribute is expressed as
    * as string in the following form: `[scope].AttributeName.[nested].[fields]...`.
    */
-  def resolveChildren(name: String, resolver: Resolver): Option[NamedExpression] =
-    resolve(name, children.flatMap(_.output), resolver)
+  def resolveChildren(
+      nameParts: Seq[String],
+      resolver: Resolver): Option[NamedExpression] =
+    resolve(nameParts, children.flatMap(_.output), resolver)
 
   /**
-   * Optionally resolves the given string to a [[NamedExpression]] based on the output of this
+   * Optionally resolves the given strings to a [[NamedExpression]] based on the output of this
    * LogicalPlan. The attribute is expressed as string in the following form:
    * `[scope].AttributeName.[nested].[fields]...`.
    */
-  def resolve(name: String, resolver: Resolver): Option[NamedExpression] =
-    resolve(name, output, resolver)
+  def resolve(
+      nameParts: Seq[String],
+      resolver: Resolver): Option[NamedExpression] =
+    resolve(nameParts, output, resolver)
+
+  /**
+   * Given an attribute name, split it to name parts by dot, but
+   * don't split the name parts quoted by backticks, for example,
+   * `ab.cd`.`efg` should be split into two parts "ab.cd" and "efg".
+   */
+  def resolveQuoted(
+      name: String,
+      resolver: Resolver): Option[NamedExpression] = {
+    resolve(parseAttributeName(name), output, resolver)
+  }
+
+  /**
+   * Internal method, used to split attribute name by dot with backticks rule.
+   * Backticks must appear in pairs, and the quoted string must be a complete name part,
+   * which means `ab..c`e.f is not allowed.
+   * Escape character is not supported now, so we can't use backtick inside name part.
+   */
+  private def parseAttributeName(name: String): Seq[String] = {
+    val e = new AnalysisException(s"syntax error in attribute name: $name")
+    val nameParts = scala.collection.mutable.ArrayBuffer.empty[String]
+    val tmp = scala.collection.mutable.ArrayBuffer.empty[Char]
+    var inBacktick = false
+    var i = 0
+    while (i < name.length) {
+      val char = name(i)
+      if (inBacktick) {
+        if (char == '`') {
+          inBacktick = false
+          if (i + 1 < name.length && name(i + 1) != '.') throw e
+        } else {
+          tmp += char
+        }
+      } else {
+        if (char == '`') {
+          if (tmp.nonEmpty) throw e
+          inBacktick = true
+        } else if (char == '.') {
+          if (tmp.isEmpty) throw e
+          nameParts += tmp.mkString
+          tmp.clear()
+        } else {
+          tmp += char
+        }
+      }
+      i += 1
+    }
+    if (tmp.isEmpty || inBacktick) throw e
+    nameParts += tmp.mkString
+    nameParts.toSeq
+  }
 
   /**
    * Resolve the given `name` string against the given attribute, returning either 0 or 1 match.
@@ -124,7 +183,7 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
    * See the comment above `candidates` variable in resolve() for semantics the returned data.
    */
   private def resolveAsTableColumn(
-      nameParts: Array[String],
+      nameParts: Seq[String],
       resolver: Resolver,
       attribute: Attribute): Option[(Attribute, List[String])] = {
     assert(nameParts.length > 1)
@@ -144,7 +203,7 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
    * See the comment above `candidates` variable in resolve() for semantics the returned data.
    */
   private def resolveAsColumn(
-      nameParts: Array[String],
+      nameParts: Seq[String],
       resolver: Resolver,
       attribute: Attribute): Option[(Attribute, List[String])] = {
     if (resolver(attribute.name, nameParts.head)) {
@@ -156,11 +215,9 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
 
   /** Performs attribute resolution given a name and a sequence of possible attributes. */
   protected def resolve(
-      name: String,
+      nameParts: Seq[String],
       input: Seq[Attribute],
       resolver: Resolver): Option[NamedExpression] = {
-
-    val parts = name.split("\\.")
 
     // A sequence of possible candidate matches.
     // Each candidate is a tuple. The first element is a resolved attribute, followed by a list
@@ -170,9 +227,9 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
     // and the second element will be List("c").
     var candidates: Seq[(Attribute, List[String])] = {
       // If the name has 2 or more parts, try to resolve it as `table.column` first.
-      if (parts.length > 1) {
+      if (nameParts.length > 1) {
         input.flatMap { option =>
-          resolveAsTableColumn(parts, resolver, option)
+          resolveAsTableColumn(nameParts, resolver, option)
         }
       } else {
         Seq.empty
@@ -182,9 +239,11 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
     // If none of attributes match `table.column` pattern, we try to resolve it as a column.
     if (candidates.isEmpty) {
       candidates = input.flatMap { candidate =>
-        resolveAsColumn(parts, resolver, candidate)
+        resolveAsColumn(nameParts, resolver, candidate)
       }
     }
+
+    def name = UnresolvedAttribute(nameParts).name
 
     candidates.distinct match {
       // One match, no nested fields, use it.
@@ -192,14 +251,14 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
 
       // One match, but we also need to extract the requested nested field.
       case Seq((a, nestedFields)) =>
-        // The foldLeft adds UnresolvedGetField for every remaining parts of the name,
-        // and aliased it with the last part of the name.
-        // For example, consider name "a.b.c", where "a" is resolved to an existing attribute.
-        // Then this will add UnresolvedGetField("b") and UnresolvedGetField("c"), and alias
-        // the final expression as "c".
-        val fieldExprs = nestedFields.foldLeft(a: Expression)(UnresolvedGetField)
-        val aliasName = nestedFields.last
-        Some(Alias(fieldExprs, aliasName)())
+        // The foldLeft adds ExtractValues for every remaining parts of the identifier,
+        // and wrap it with UnresolvedAlias which will be removed later.
+        // For example, consider "a.b.c", where "a" is resolved to an existing attribute.
+        // Then this will add ExtractValue("c", ExtractValue("b", a)), and wrap it as
+        // UnresolvedAlias(ExtractValue("c", ExtractValue("b", a))).
+        val fieldExprs = nestedFields.foldLeft(a: Expression)((expr, fieldName) =>
+          ExtractValue(expr, Literal(fieldName), resolver))
+        Some(UnresolvedAlias(fieldExprs))
 
       // No matches.
       case Seq() =>
@@ -208,8 +267,9 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] with Logging {
 
       // More than one match.
       case ambiguousReferences =>
+        val referenceNames = ambiguousReferences.map(_._1).mkString(", ")
         throw new AnalysisException(
-          s"Ambiguous references to $name: ${ambiguousReferences.mkString(",")}")
+          s"Reference '$name' is ambiguous, could be: $referenceNames.")
     }
   }
 }
