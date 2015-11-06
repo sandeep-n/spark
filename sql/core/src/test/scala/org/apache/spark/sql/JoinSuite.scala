@@ -17,25 +17,26 @@
 
 package org.apache.spark.sql
 
-import org.scalatest.BeforeAndAfterEach
-
-import org.apache.spark.sql.TestData._
-import org.apache.spark.sql.functions._
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.execution.joins._
-import org.apache.spark.sql.test.TestSQLContext._
-import org.apache.spark.sql.test.TestSQLContext.implicits._
+import org.apache.spark.sql.test.SharedSQLContext
 
 
-class JoinSuite extends QueryTest with BeforeAndAfterEach {
-  // Ensures tables are loaded.
-  TestData
+class JoinSuite extends QueryTest with SharedSQLContext {
+  import testImplicits._
+
+  setupTestData()
+
+  def statisticSizeInByte(df: DataFrame): BigInt = {
+    df.queryExecution.optimizedPlan.statistics.sizeInBytes
+  }
 
   test("equi-join is hash-join") {
     val x = testData2.as("x")
     val y = testData2.as("y")
-    val join = x.join(y, $"x.a" === $"y.a", "inner").queryExecution.analyzed
-    val planned = planner.HashJoin(join)
+    val join = x.join(y, $"x.a" === $"y.a", "inner").queryExecution.optimizedPlan
+    val planned = sqlContext.planner.EquiJoinSelection(join)
     assert(planned.size === 1)
   }
 
@@ -44,13 +45,16 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
     val physical = df.queryExecution.sparkPlan
     val operators = physical.collect {
       case j: ShuffledHashJoin => j
-      case j: HashOuterJoin => j
+      case j: ShuffledHashOuterJoin => j
       case j: LeftSemiJoinHash => j
       case j: BroadcastHashJoin => j
+      case j: BroadcastHashOuterJoin => j
       case j: LeftSemiJoinBNL => j
       case j: CartesianProduct => j
       case j: BroadcastNestedLoopJoin => j
       case j: BroadcastLeftSemiJoinHash => j
+      case j: SortMergeJoin => j
+      case j: SortMergeOuterJoin => j
     }
 
     assert(operators.size === 1)
@@ -60,7 +64,7 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
   }
 
   test("join operator selection") {
-    cacheManager.clearCache()
+    sqlContext.cacheManager.clearCache()
 
     Seq(
       ("SELECT * FROM testData LEFT SEMI JOIN testData2 ON key = a", classOf[LeftSemiJoinHash]),
@@ -75,15 +79,16 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
       ("SELECT * FROM testData FULL OUTER JOIN testData2 WHERE key = 2", classOf[CartesianProduct]),
       ("SELECT * FROM testData JOIN testData2 WHERE key > a", classOf[CartesianProduct]),
       ("SELECT * FROM testData FULL OUTER JOIN testData2 WHERE key > a", classOf[CartesianProduct]),
-      ("SELECT * FROM testData JOIN testData2 ON key = a", classOf[ShuffledHashJoin]),
-      ("SELECT * FROM testData JOIN testData2 ON key = a and key = 2", classOf[ShuffledHashJoin]),
-      ("SELECT * FROM testData JOIN testData2 ON key = a where key = 2", classOf[ShuffledHashJoin]),
-      ("SELECT * FROM testData LEFT JOIN testData2 ON key = a", classOf[HashOuterJoin]),
+      ("SELECT * FROM testData JOIN testData2 ON key = a", classOf[SortMergeJoin]),
+      ("SELECT * FROM testData JOIN testData2 ON key = a and key = 2", classOf[SortMergeJoin]),
+      ("SELECT * FROM testData JOIN testData2 ON key = a where key = 2", classOf[SortMergeJoin]),
+      ("SELECT * FROM testData LEFT JOIN testData2 ON key = a", classOf[SortMergeOuterJoin]),
       ("SELECT * FROM testData RIGHT JOIN testData2 ON key = a where key = 2",
-        classOf[HashOuterJoin]),
+        classOf[SortMergeOuterJoin]),
       ("SELECT * FROM testData right join testData2 ON key = a and key = 2",
-        classOf[HashOuterJoin]),
-      ("SELECT * FROM testData full outer join testData2 ON key = a", classOf[HashOuterJoin]),
+        classOf[SortMergeOuterJoin]),
+      ("SELECT * FROM testData full outer join testData2 ON key = a",
+        classOf[SortMergeOuterJoin]),
       ("SELECT * FROM testData left JOIN testData2 ON (key * a != key + a)",
         classOf[BroadcastNestedLoopJoin]),
       ("SELECT * FROM testData right JOIN testData2 ON (key * a != key + a)",
@@ -91,26 +96,83 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
       ("SELECT * FROM testData full JOIN testData2 ON (key * a != key + a)",
         classOf[BroadcastNestedLoopJoin])
     ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
+    withSQLConf(SQLConf.SORTMERGE_JOIN.key -> "false") {
+      Seq(
+        ("SELECT * FROM testData JOIN testData2 ON key = a", classOf[ShuffledHashJoin]),
+        ("SELECT * FROM testData JOIN testData2 ON key = a and key = 2",
+          classOf[ShuffledHashJoin]),
+        ("SELECT * FROM testData JOIN testData2 ON key = a where key = 2",
+          classOf[ShuffledHashJoin]),
+        ("SELECT * FROM testData LEFT JOIN testData2 ON key = a", classOf[ShuffledHashOuterJoin]),
+        ("SELECT * FROM testData RIGHT JOIN testData2 ON key = a where key = 2",
+          classOf[ShuffledHashOuterJoin]),
+        ("SELECT * FROM testData right join testData2 ON key = a and key = 2",
+          classOf[ShuffledHashOuterJoin]),
+        ("SELECT * FROM testData full outer join testData2 ON key = a",
+          classOf[ShuffledHashOuterJoin])
+      ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
+    }
+  }
+
+  test("SortMergeJoin shouldn't work on unsortable columns") {
+    withSQLConf(SQLConf.SORTMERGE_JOIN.key -> "true") {
+      Seq(
+        ("SELECT * FROM arrayData JOIN complexData ON data = a", classOf[ShuffledHashJoin])
+      ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
+    }
   }
 
   test("broadcasted hash join operator selection") {
-    cacheManager.clearCache()
+    sqlContext.cacheManager.clearCache()
     sql("CACHE TABLE testData")
+    for (sortMergeJoinEnabled <- Seq(true, false)) {
+      withClue(s"sortMergeJoinEnabled=$sortMergeJoinEnabled") {
+        withSQLConf(SQLConf.SORTMERGE_JOIN.key -> s"$sortMergeJoinEnabled") {
+          Seq(
+            ("SELECT * FROM testData join testData2 ON key = a",
+              classOf[BroadcastHashJoin]),
+            ("SELECT * FROM testData join testData2 ON key = a and key = 2",
+              classOf[BroadcastHashJoin]),
+            ("SELECT * FROM testData join testData2 ON key = a where key = 2",
+              classOf[BroadcastHashJoin])
+          ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
+        }
+      }
+    }
+    sql("UNCACHE TABLE testData")
+  }
 
-    Seq(
-      ("SELECT * FROM testData join testData2 ON key = a", classOf[BroadcastHashJoin]),
-      ("SELECT * FROM testData join testData2 ON key = a and key = 2", classOf[BroadcastHashJoin]),
-      ("SELECT * FROM testData join testData2 ON key = a where key = 2", classOf[BroadcastHashJoin])
-    ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
-
+  test("broadcasted hash outer join operator selection") {
+    sqlContext.cacheManager.clearCache()
+    sql("CACHE TABLE testData")
+    withSQLConf(SQLConf.SORTMERGE_JOIN.key -> "true") {
+      Seq(
+        ("SELECT * FROM testData LEFT JOIN testData2 ON key = a",
+          classOf[SortMergeOuterJoin]),
+        ("SELECT * FROM testData RIGHT JOIN testData2 ON key = a where key = 2",
+          classOf[BroadcastHashOuterJoin]),
+        ("SELECT * FROM testData right join testData2 ON key = a and key = 2",
+          classOf[BroadcastHashOuterJoin])
+      ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
+    }
+    withSQLConf(SQLConf.SORTMERGE_JOIN.key -> "false") {
+      Seq(
+        ("SELECT * FROM testData LEFT JOIN testData2 ON key = a",
+          classOf[ShuffledHashOuterJoin]),
+        ("SELECT * FROM testData RIGHT JOIN testData2 ON key = a where key = 2",
+          classOf[BroadcastHashOuterJoin]),
+        ("SELECT * FROM testData right join testData2 ON key = a and key = 2",
+          classOf[BroadcastHashOuterJoin])
+      ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
+    }
     sql("UNCACHE TABLE testData")
   }
 
   test("multiple-key equi-join is hash-join") {
     val x = testData2.as("x")
     val y = testData2.as("y")
-    val join = x.join(y, ($"x.a" === $"y.a") && ($"x.b" === $"y.b")).queryExecution.analyzed
-    val planned = planner.HashJoin(join)
+    val join = x.join(y, ($"x.a" === $"y.a") && ($"x.b" === $"y.b")).queryExecution.optimizedPlan
+    val planned = sqlContext.planner.EquiJoinSelection(join)
     assert(planned.size === 1)
   }
 
@@ -141,10 +203,10 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
     val y = testData2.where($"a" === 1).as("y")
     checkAnswer(
       x.join(y).where($"x.a" === $"y.a"),
-      Row(1,1,1,1) ::
-      Row(1,1,1,2) ::
-      Row(1,2,1,1) ::
-      Row(1,2,1,2) :: Nil
+      Row(1, 1, 1, 1) ::
+      Row(1, 1, 1, 2) ::
+      Row(1, 2, 1, 1) ::
+      Row(1, 2, 1, 2) :: Nil
     )
   }
 
@@ -302,8 +364,8 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
     upperCaseData.where('N <= 4).registerTempTable("left")
     upperCaseData.where('N >= 3).registerTempTable("right")
 
-    val left = UnresolvedRelation(Seq("left"), None)
-    val right = UnresolvedRelation(Seq("right"), None)
+    val left = UnresolvedRelation(TableIdentifier("left"), None)
+    val right = UnresolvedRelation(TableIdentifier("right"), None)
 
     checkAnswer(
       left.join(right, $"left.N" === $"right.N", "full"),
@@ -385,27 +447,114 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
   }
 
   test("broadcasted left semi join operator selection") {
-    cacheManager.clearCache()
+    sqlContext.cacheManager.clearCache()
     sql("CACHE TABLE testData")
-    val tmp = conf.autoBroadcastJoinThreshold
 
-    sql(s"SET ${SQLConf.AUTO_BROADCASTJOIN_THRESHOLD}=1000000000")
-    Seq(
-      ("SELECT * FROM testData LEFT SEMI JOIN testData2 ON key = a",
-        classOf[BroadcastLeftSemiJoinHash])
-    ).foreach {
-      case (query, joinClass) => assertJoin(query, joinClass)
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "1000000000") {
+      Seq(
+        ("SELECT * FROM testData LEFT SEMI JOIN testData2 ON key = a",
+          classOf[BroadcastLeftSemiJoinHash])
+      ).foreach {
+        case (query, joinClass) => assertJoin(query, joinClass)
+      }
     }
 
-    sql(s"SET ${SQLConf.AUTO_BROADCASTJOIN_THRESHOLD}=-1")
-
-    Seq(
-      ("SELECT * FROM testData LEFT SEMI JOIN testData2 ON key = a", classOf[LeftSemiJoinHash])
-    ).foreach {
-      case (query, joinClass) => assertJoin(query, joinClass)
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+      Seq(
+        ("SELECT * FROM testData LEFT SEMI JOIN testData2 ON key = a", classOf[LeftSemiJoinHash])
+      ).foreach {
+        case (query, joinClass) => assertJoin(query, joinClass)
+      }
     }
 
-    setConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD, tmp.toString)
+    sql("UNCACHE TABLE testData")
+  }
+
+  test("cross join with broadcast") {
+    sql("CACHE TABLE testData")
+
+    val sizeInByteOfTestData = statisticSizeInByte(sqlContext.table("testData"))
+
+    // we set the threshold is greater than statistic of the cached table testData
+    withSQLConf(
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> (sizeInByteOfTestData + 1).toString()) {
+
+      assert(statisticSizeInByte(sqlContext.table("testData2")) >
+        sqlContext.conf.autoBroadcastJoinThreshold)
+
+      assert(statisticSizeInByte(sqlContext.table("testData")) <
+        sqlContext.conf.autoBroadcastJoinThreshold)
+
+      Seq(
+        ("SELECT * FROM testData LEFT SEMI JOIN testData2 ON key = a",
+          classOf[LeftSemiJoinHash]),
+        ("SELECT * FROM testData LEFT SEMI JOIN testData2",
+          classOf[LeftSemiJoinBNL]),
+        ("SELECT * FROM testData JOIN testData2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData JOIN testData2 WHERE key = 2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData LEFT JOIN testData2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData RIGHT JOIN testData2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData FULL OUTER JOIN testData2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData LEFT JOIN testData2 WHERE key = 2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData RIGHT JOIN testData2 WHERE key = 2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData FULL OUTER JOIN testData2 WHERE key = 2",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData JOIN testData2 WHERE key > a",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData FULL OUTER JOIN testData2 WHERE key > a",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData left JOIN testData2 WHERE (key * a != key + a)",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData right JOIN testData2 WHERE (key * a != key + a)",
+          classOf[BroadcastNestedLoopJoin]),
+        ("SELECT * FROM testData full JOIN testData2 WHERE (key * a != key + a)",
+          classOf[BroadcastNestedLoopJoin])
+      ).foreach { case (query, joinClass) => assertJoin(query, joinClass) }
+
+      checkAnswer(
+        sql(
+          """
+            SELECT x.value, y.a, y.b FROM testData x JOIN testData2 y WHERE x.key = 2
+          """.stripMargin),
+        Row("2", 1, 1) ::
+        Row("2", 1, 2) ::
+        Row("2", 2, 1) ::
+        Row("2", 2, 2) ::
+        Row("2", 3, 1) ::
+        Row("2", 3, 2) :: Nil)
+
+      checkAnswer(
+        sql(
+          """
+            SELECT x.value, y.a, y.b FROM testData x JOIN testData2 y WHERE x.key < y.a
+          """.stripMargin),
+        Row("1", 2, 1) ::
+        Row("1", 2, 2) ::
+        Row("1", 3, 1) ::
+        Row("1", 3, 2) ::
+        Row("2", 3, 1) ::
+        Row("2", 3, 2) :: Nil)
+
+      checkAnswer(
+        sql(
+          """
+            SELECT x.value, y.a, y.b FROM testData x JOIN testData2 y ON x.key < y.a
+          """.stripMargin),
+        Row("1", 2, 1) ::
+          Row("1", 2, 2) ::
+          Row("1", 3, 1) ::
+          Row("1", 3, 2) ::
+          Row("2", 3, 1) ::
+          Row("2", 3, 2) :: Nil)
+    }
+
     sql("UNCACHE TABLE testData")
   }
 
@@ -418,6 +567,5 @@ class JoinSuite extends QueryTest with BeforeAndAfterEach {
         Row(2, 2) ::
         Row(3, 1) ::
         Row(3, 2) :: Nil)
-
   }
 }
